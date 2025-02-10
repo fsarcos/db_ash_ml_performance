@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Create a clean directory for packaging
-PACKAGE_DIR="oracle_ash_package"
+PACKAGE_DIR="oracle_db_ml_ash_monitoring"
 VENV_DIR="venv"
 REQUIREMENTS_FILE="requirements.txt"
 
@@ -19,6 +19,7 @@ numpy==1.19.5
 scikit-learn==0.24.2
 matplotlib==3.3.4
 seaborn==0.11.2
+Pillow==8.4.0  # Last version supporting Python 3.6
 EOF
 fi
 
@@ -27,9 +28,9 @@ echo "Creating virtual environment..."
 python3 -m venv $VENV_DIR
 source $VENV_DIR/bin/activate
 
-# Download packages without installing
+# Download packages without installing, specifically requesting wheels
 echo "Downloading packages..."
-pip download -r $REQUIREMENTS_FILE -d $PACKAGE_DIR/packages
+pip download --only-binary :all: -r $REQUIREMENTS_FILE -d $PACKAGE_DIR/packages
 
 # Copy source files
 echo "Copying source files..."
@@ -67,7 +68,7 @@ EOF
 
 # Create archive
 echo "Creating archive..."
-tar -czf oracle_ash_package.tar.gz $PACKAGE_DIR
+tar -czf oracle_db_ml_ash_monitoring.tar.gz $PACKAGE_DIR
 
 # Cleanup
 echo "Cleaning up..."
@@ -75,5 +76,5 @@ rm -rf $PACKAGE_DIR
 deactivate
 rm -rf $VENV_DIR
 
-echo "Package created: oracle_ash_package.tar.gz"
+echo "Package created: oracle_db_ml_ash_monitoring.tar.gz"
 echo "Transfer this file to your target server and follow the instructions in INSTALL.txt"
