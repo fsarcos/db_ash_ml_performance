@@ -1,8 +1,5 @@
 requirements.txt
 oracle_db_ml_ash_monitoring.tar.gz
 src/python/__pycache__/
-src/python/analysis_results/
-src/python/analyze_contention.py
-src/python/analyze_patterns.py
-src/python/analyze_sql_patterns.py
-src/python/database_analysis/
+src/python/analysis_results/*
+src/python/database_analysis/*
