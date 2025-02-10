@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import time
 import json
 import numpy as np
-from config import ORACLE_ENV, ASH_CONFIG, MONITORING_CONFIG, FILE_PATHS, SEVERITY_CONFIG
+from config import ORACLE_ENV, ASH_CONFIG, MONITORING_CONFIG, SEVERITY_CONFIG, get_pdb_directories, ensure_directories_exist
 from train_model import preprocess_ash_data
 
 def setup_oracle_env():
@@ -54,14 +54,17 @@ def colorize(text, severity):
     return f"{color}{text}{SEVERITY_CONFIG['colors']['RESET']}"
 
 class ResultsManager:
-    def __init__(self, results_dir):
-        self.results_dir = results_dir
+    def __init__(self, monitoring_dir):
+        self.monitoring_dir = monitoring_dir
         self.current_file = None
         self.current_count = 0
-        os.makedirs(os.path.join(results_dir, 'hourly'), exist_ok=True)
+        
+        # Create hourly directory
+        self.hourly_dir = os.path.join(monitoring_dir, 'hourly')
+        os.makedirs(self.hourly_dir, exist_ok=True)
         
         # Initialize or load summary index
-        self.index_file = os.path.join(results_dir, 'summary_index.json')
+        self.index_file = os.path.join(monitoring_dir, 'summary_index.json')
         self.load_index()
 
     def load_index(self):
@@ -83,8 +86,7 @@ class ResultsManager:
     def get_hourly_filename(self, timestamp):
         """Generate hourly filename based on timestamp"""
         return os.path.join(
-            self.results_dir,
-            'hourly',
+            self.hourly_dir,
             f"{timestamp.strftime('%Y%m%d_%H')}.json"
         )
 
@@ -94,12 +96,11 @@ class ResultsManager:
         cutoff_date = datetime.now() - timedelta(days=retention_days)
         
         # Clean up hourly files
-        hourly_dir = os.path.join(self.results_dir, 'hourly')
-        for filename in os.listdir(hourly_dir):
+        for filename in os.listdir(self.hourly_dir):
             try:
                 file_date = datetime.strptime(filename.split('_')[0], '%Y%m%d')
                 if file_date < cutoff_date:
-                    os.remove(os.path.join(hourly_dir, filename))
+                    os.remove(os.path.join(self.hourly_dir, filename))
                     # Remove from index if exists
                     if filename in self.index['files']:
                         del self.index['files'][filename]
@@ -143,8 +144,9 @@ class ResultsManager:
             return
         
         # Save current state
+        current_file = os.path.join(self.monitoring_dir, 'current.json')
         try:
-            with open(FILE_PATHS['current_results_file'], 'w') as f:
+            with open(current_file, 'w') as f:
                 json.dump(results, f, indent=2)
         except Exception as e:
             print(f"Error saving current results: {e}")
@@ -153,8 +155,8 @@ class ResultsManager:
         self.save_index()
 
 class RACASHMonitor:
-    def __init__(self, model_file, scaler_file, feature_columns_file):
-        self.results_manager = ResultsManager(FILE_PATHS['monitoring_results_dir'])
+    def __init__(self, model_file, scaler_file, feature_columns_file, monitoring_dir):
+        self.results_manager = ResultsManager(monitoring_dir)
 
         # Load model and scaler
         with open(model_file, 'rb') as f:
@@ -490,10 +492,16 @@ class RACASHMonitor:
 if __name__ == "__main__":
     try:
         print("Starting ASH monitoring...")
+        
+        # Get PDB-specific paths and ensure directories exist
+        paths = get_pdb_directories()
+        ensure_directories_exist(paths)
+        
         monitor = RACASHMonitor(
-            FILE_PATHS['model_file'],
-            FILE_PATHS['scaler_file'],
-            FILE_PATHS['feature_columns_file']
+            paths['model_file'],
+            paths['scaler_file'],
+            paths['feature_columns_file'],
+            paths['monitoring_dir']
         )
         print("Monitor initialized. Starting monitoring loop...")
         monitor.monitor()

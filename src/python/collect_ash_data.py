@@ -2,9 +2,9 @@ import cx_Oracle
 import pandas as pd
 import json
 import os
-import sys  # Add sys module import
+import sys
 from datetime import datetime, timedelta
-from config import ORACLE_ENV, ASH_CONFIG, FILE_PATHS
+from config import ORACLE_ENV, ASH_CONFIG, FILE_PATHS, get_pdb_directories, ensure_directories_exist
 
 def setup_oracle_env():
     """Setup Oracle environment variables if not already set"""
@@ -139,6 +139,9 @@ def collect_historical_ash(start_date, end_date, output_file):
             # Validate and process the data
             df = validate_ash_data(df)
 
+            # Ensure output directory exists
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
             # Save data in specified format
             if ASH_CONFIG['data_format'].lower() == 'csv':
                 df.to_csv(output_file, index=False)
@@ -173,13 +176,18 @@ def collect_historical_ash(start_date, end_date, output_file):
 if __name__ == "__main__":
     try:
         print("Starting historical ASH data collection...")
+        
+        # Get PDB-specific paths and ensure directories exist
+        paths = get_pdb_directories()
+        ensure_directories_exist(paths)
+        
         START_DATE = datetime.now() - timedelta(days=ASH_CONFIG['retention_days'])
         END_DATE = datetime.now()
 
         collect_historical_ash(
             START_DATE,
             END_DATE,
-            FILE_PATHS['historical_data_file']
+            paths['historical_data_file']
         )
         print("Data collection completed successfully")
 

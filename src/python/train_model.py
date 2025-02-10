@@ -1,8 +1,9 @@
 import pandas as pd
 import pickle
+import os
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
-from config import FILE_PATHS, ASH_CONFIG, MONITORING_CONFIG
+from config import FILE_PATHS, ASH_CONFIG, MONITORING_CONFIG, get_pdb_directories, ensure_directories_exist
 
 def preprocess_ash_data(df):
     """Preprocesses the ASH data for anomaly detection"""
@@ -97,10 +98,13 @@ def train_model(data_file, model_output_file, scaler_output_file, feature_column
         model = IsolationForest(
             contamination=MONITORING_CONFIG['contamination'],
             random_state=42,
-            n_estimators=100,  # Added explicit n_estimators
-            max_samples='auto'  # Use 'auto' instead of min_samples
+            n_estimators=100,
+            max_samples='auto'
         )
         model.fit(scaled_features)
+        
+        # Ensure output directories exist
+        os.makedirs(os.path.dirname(model_output_file), exist_ok=True)
         
         # Save model and scaler
         print(f"Saving model to {model_output_file}")
@@ -125,13 +129,18 @@ def train_model(data_file, model_output_file, scaler_output_file, feature_column
 if __name__ == "__main__":
     try:
         print("Starting model training process...")
-        print(f"Using data file: {FILE_PATHS['historical_data_file']}")
+        
+        # Get PDB-specific paths and ensure directories exist
+        paths = get_pdb_directories()
+        ensure_directories_exist(paths)
+        
+        print(f"Using data file: {paths['historical_data_file']}")
         
         train_model(
-            FILE_PATHS['historical_data_file'],
-            FILE_PATHS['model_file'],
-            FILE_PATHS['scaler_file'],
-            FILE_PATHS['feature_columns_file']
+            paths['historical_data_file'],
+            paths['model_file'],
+            paths['scaler_file'],
+            paths['feature_columns_file']
         )
     except Exception as e:
         print(f"Failed to train model: {str(e)}")
