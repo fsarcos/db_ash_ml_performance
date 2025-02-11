@@ -36,19 +36,28 @@ class ContentionAnalyzer:
         blocking_metrics = blocking_df.groupby(['sample_time', 'blocking_session']).agg({
             'session_count': ['sum', 'count'],  # Total sessions affected and count of blocked sessions
             'wait_class': lambda x: x.value_counts().index[0],  # Most common wait class
-            'event': lambda x: x.value_counts().index[0]  # Most common event
+            'event_extended': lambda x: x.value_counts().index[0],  # Use extended event info
+            'pga_allocated': 'sum',  # Total PGA used by blocked sessions
+            'temp_space_allocated': 'sum'  # Total temp space used by blocked sessions
         }).reset_index()
         
         # Flatten column names
         blocking_metrics.columns = ['sample_time', 'blocking_session', 'total_sessions', 
-                                  'blocked_count', 'wait_class', 'event']
+                                  'blocked_count', 'wait_class', 'event',
+                                  'pga_allocated', 'temp_space_allocated']
+        
+        # Convert memory metrics to GB
+        blocking_metrics['pga_gb'] = blocking_metrics['pga_allocated'] / 1024 / 1024 / 1024
+        blocking_metrics['temp_space_gb'] = blocking_metrics['temp_space_allocated'] / 1024 / 1024 / 1024
         
         # Calculate chain statistics
         chain_stats = blocking_metrics.groupby('blocking_session').agg({
             'blocked_count': ['mean', 'max'],  # Average and max blocked sessions
             'total_sessions': 'sum',  # Total impact
             'wait_class': lambda x: x.value_counts().index[0],
-            'event': lambda x: x.value_counts().index[0]
+            'event': lambda x: x.value_counts().index[0],
+            'pga_gb': ['mean', 'max'],  # Memory impact
+            'temp_space_gb': ['mean', 'max']  # Temp space impact
         })
         
         return blocking_metrics, chain_stats
@@ -63,10 +72,16 @@ class ContentionAnalyzer:
             return pd.DataFrame()
         
         # Calculate resource contention metrics
-        resource_metrics = resource_df.groupby(['sample_time', 'wait_class', 'event']).agg({
+        resource_metrics = resource_df.groupby(['sample_time', 'wait_class', 'event_extended']).agg({
             'session_count': 'sum',
-            'instance_number': 'nunique'
+            'instance_number': 'nunique',
+            'pga_allocated': 'sum',
+            'temp_space_allocated': 'sum'
         }).reset_index()
+        
+        # Convert memory metrics to GB
+        resource_metrics['pga_gb'] = resource_metrics['pga_allocated'] / 1024 / 1024 / 1024
+        resource_metrics['temp_space_gb'] = resource_metrics['temp_space_allocated'] / 1024 / 1024 / 1024
         
         # Add hour for temporal analysis
         resource_metrics['hour'] = resource_metrics['sample_time'].dt.hour
@@ -79,8 +94,14 @@ class ContentionAnalyzer:
         instance_metrics = self.df.groupby(['sample_time', 'instance_number']).agg({
             'session_count': 'sum',
             'wait_class': lambda x: x.value_counts().to_dict(),
-            'blocking_session': lambda x: x.notna().sum()
+            'blocking_session': lambda x: x.notna().sum(),
+            'pga_allocated': 'sum',
+            'temp_space_allocated': 'sum'
         }).reset_index()
+        
+        # Convert memory metrics to GB
+        instance_metrics['pga_gb'] = instance_metrics['pga_allocated'] / 1024 / 1024 / 1024
+        instance_metrics['temp_space_gb'] = instance_metrics['temp_space_allocated'] / 1024 / 1024 / 1024
         
         # Calculate skew metrics
         total_sessions = instance_metrics.groupby('sample_time')['session_count'].sum()
@@ -110,6 +131,17 @@ class ContentionAnalyzer:
             plt.grid(True, alpha=0.3)
             self.save_plot('blocking_impact')
 
+            # Memory Impact of Blocking Sessions
+            plt.figure(figsize=(15, 7))
+            plt.plot(blocking_metrics['sample_time'], blocking_metrics['pga_gb'], label='PGA')
+            plt.plot(blocking_metrics['sample_time'], blocking_metrics['temp_space_gb'], label='Temp Space')
+            plt.title('Memory Impact of Blocking Sessions')
+            plt.xlabel('Time')
+            plt.ylabel('GB')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            self.save_plot('blocking_memory_impact')
+
         if not resource_metrics.empty:
             # Resource Contention Heatmap
             plt.figure(figsize=(15, 8))
@@ -134,6 +166,24 @@ class ContentionAnalyzer:
             plt.grid(True, alpha=0.3)
             self.save_plot('instance_workload_distribution')
 
+            # Instance Memory Usage
+            plt.figure(figsize=(15, 7))
+            instance_memory = instance_metrics.groupby('instance_number').agg({
+                'pga_gb': 'mean',
+                'temp_space_gb': 'mean'
+            }).reset_index()
+            instance_memory_melted = pd.melt(
+                instance_memory,
+                id_vars=['instance_number'],
+                value_vars=['pga_gb', 'temp_space_gb'],
+                var_name='Memory Type',
+                value_name='GB'
+            )
+            sns.barplot(data=instance_memory_melted, x='instance_number', y='GB', hue='Memory Type')
+            plt.title('Average Memory Usage by Instance')
+            plt.grid(True, alpha=0.3)
+            self.save_plot('instance_memory_usage')
+
         # Prepare report data
         report = {
             'analysis_period': {
@@ -149,8 +199,14 @@ class ContentionAnalyzer:
                         'avg_blocked_sessions': float(stats['blocked_count']['mean']),
                         'max_blocked_sessions': float(stats['blocked_count']['max']),
                         'total_impact': float(stats['total_sessions']),
-                        'primary_wait_class': str(stats['wait_class']),  # Convert to string
-                        'primary_event': str(stats['event'])  # Convert to string
+                        'primary_wait_class': str(stats['wait_class']),
+                        'primary_event': str(stats['event']),
+                        'memory_impact': {
+                            'avg_pga_gb': float(stats['pga_gb']['mean']),
+                            'max_pga_gb': float(stats['pga_gb']['max']),
+                            'avg_temp_gb': float(stats['temp_space_gb']['mean']),
+                            'max_temp_gb': float(stats['temp_space_gb']['max'])
+                        }
                     }
                     for session, stats in chain_stats.iterrows()
                 ] if not chain_stats.empty else []
@@ -158,13 +214,17 @@ class ContentionAnalyzer:
             'resource_contention': {
                 'top_contentions': [
                     {
-                        'wait_class': str(wait_class),  # Convert to string
-                        'event': str(event),  # Convert to string
+                        'wait_class': str(wait_class),
+                        'event': str(event),
                         'avg_sessions': float(metrics['session_count'].mean()),
                         'peak_sessions': float(metrics['session_count'].max()),
-                        'instances_affected': int(metrics['instance_number'].max())
+                        'instances_affected': int(metrics['instance_number'].max()),
+                        'memory_usage': {
+                            'avg_pga_gb': float(metrics['pga_gb'].mean()),
+                            'avg_temp_gb': float(metrics['temp_space_gb'].mean())
+                        }
                     }
-                    for (wait_class, event), metrics in resource_metrics.groupby(['wait_class', 'event'])
+                    for (wait_class, event), metrics in resource_metrics.groupby(['wait_class', 'event_extended'])
                 ] if not resource_metrics.empty else []
             },
             'instance_analysis': {
@@ -174,6 +234,12 @@ class ContentionAnalyzer:
                         'avg_workload_percentage': float(metrics['workload_percentage'].mean()),
                         'peak_workload_percentage': float(metrics['workload_percentage'].max()),
                         'blocking_incidents': int(metrics['blocking_session'].sum()),
+                        'memory_usage': {
+                            'avg_pga_gb': float(metrics['pga_gb'].mean()),
+                            'peak_pga_gb': float(metrics['pga_gb'].max()),
+                            'avg_temp_gb': float(metrics['temp_space_gb'].mean()),
+                            'peak_temp_gb': float(metrics['temp_space_gb'].max())
+                        },
                         'wait_classes': {
                             str(k): float(v) for k, v in metrics['wait_class'].iloc[0].items()
                         } if not metrics['wait_class'].empty else {}
@@ -218,6 +284,10 @@ def main():
                 print(f"- Maximum Blocked Sessions: {blocker['max_blocked_sessions']}")
                 print(f"- Primary Wait Class: {blocker['primary_wait_class']}")
                 print(f"- Primary Event: {blocker['primary_event']}")
+                print("- Memory Impact:")
+                mem = blocker['memory_impact']
+                print(f"  * PGA: Avg {mem['avg_pga_gb']:.2f} GB, Peak {mem['max_pga_gb']:.2f} GB")
+                print(f"  * Temp: Avg {mem['avg_temp_gb']:.2f} GB, Peak {mem['max_temp_gb']:.2f} GB")
         
         if report['resource_contention']['top_contentions']:
             print("\nTop Resource Contentions:")
@@ -227,6 +297,10 @@ def main():
                 print(f"- Average Sessions: {contention['avg_sessions']:.2f}")
                 print(f"- Peak Sessions: {contention['peak_sessions']}")
                 print(f"- Instances Affected: {contention['instances_affected']}")
+                print("- Memory Usage:")
+                mem = contention['memory_usage']
+                print(f"  * PGA: {mem['avg_pga_gb']:.2f} GB")
+                print(f"  * Temp: {mem['avg_temp_gb']:.2f} GB")
         
         if report['instance_analysis']['instance_metrics']:
             print("\nInstance Workload Distribution:")
@@ -235,6 +309,10 @@ def main():
                 print(f"- Average Workload: {instance['avg_workload_percentage']:.1f}%")
                 print(f"- Peak Workload: {instance['peak_workload_percentage']:.1f}%")
                 print(f"- Blocking Incidents: {instance['blocking_incidents']}")
+                print("- Memory Usage:")
+                mem = instance['memory_usage']
+                print(f"  * PGA: Avg {mem['avg_pga_gb']:.2f} GB, Peak {mem['peak_pga_gb']:.2f} GB")
+                print(f"  * Temp: Avg {mem['avg_temp_gb']:.2f} GB, Peak {mem['peak_temp_gb']:.2f} GB")
                 if instance['wait_classes']:
                     print("- Top Wait Classes:")
                     for wait_class, count in sorted(instance['wait_classes'].items(), 

@@ -1,11 +1,11 @@
 import cx_Oracle
 import pandas as pd
+import numpy as np
 import pickle
 import os
 from datetime import datetime, timedelta
 import time
 import json
-import numpy as np
 from config import ORACLE_ENV, ASH_CONFIG, MONITORING_CONFIG, SEVERITY_CONFIG, get_pdb_directories, ensure_directories_exist
 from train_model import preprocess_ash_data
 
@@ -193,7 +193,9 @@ class RACASHMonitor:
                 s.wait_class,
                 s.event,
                 s.sql_id,
-                q.sql_text
+                q.sql_text,
+                s.pga_allocated,
+                s.temp_space_allocated
             FROM gv$session s
             LEFT JOIN dba_users u ON s.user# = u.user_id
             LEFT JOIN v$sql q ON s.sql_id = q.sql_id
@@ -213,6 +215,10 @@ class RACASHMonitor:
                 cursor.close()
                 
                 if row and row[0]:  # If there's a blocking session
+                    # Convert memory metrics to GB
+                    pga_gb = float(row[9]) / 1024 / 1024 / 1024 if row[9] else 0
+                    temp_gb = float(row[10]) / 1024 / 1024 / 1024 if row[10] else 0
+                    
                     blocking_info = {
                         'session_id': int(row[0]),
                         'session_serial#': int(row[1]) if row[1] else None,
@@ -222,7 +228,11 @@ class RACASHMonitor:
                         'wait_class': str(row[5]) if row[5] else None,
                         'event': str(row[6]) if row[6] else None,
                         'sql_id': str(row[7]) if row[7] else None,
-                        'sql_text': str(row[8])[:100] if row[8] else None
+                        'sql_text': str(row[8])[:100] if row[8] else None,
+                        'memory_usage': {
+                            'pga_gb': pga_gb,
+                            'temp_space_gb': temp_gb
+                        }
                     }
                     blocking_chain.append(blocking_info)
                     current_session = {
@@ -255,6 +265,20 @@ class RACASHMonitor:
             reasons.append(f'High anomaly score ({score:.3f})')
         else:
             reasons.append(f'Normal anomaly score ({score:.3f})')
+        
+        # Check memory usage
+        memory = session_details.get('memory_usage', {})
+        if memory:
+            pga_gb = memory.get('pga_gb', 0)
+            temp_gb = memory.get('temp_space_gb', 0)
+            if pga_gb > 10 or temp_gb > 10:  # More than 10GB of either type
+                severity = max(severity, 'CRITICAL')
+                reasons.append(f'High memory usage (PGA: {pga_gb:.2f} GB, Temp: {temp_gb:.2f} GB)')
+            elif pga_gb > 5 or temp_gb > 5:  # More than 5GB of either type
+                severity = max(severity, 'HIGH')
+                reasons.append(f'Elevated memory usage (PGA: {pga_gb:.2f} GB, Temp: {temp_gb:.2f} GB)')
+            else:
+                reasons.append(f'Normal memory usage (PGA: {pga_gb:.2f} GB, Temp: {temp_gb:.2f} GB)')
         
         # Check wait class severity from config
         if session_details.get('wait_class'):
@@ -298,6 +322,16 @@ class RACASHMonitor:
             ash.service_hash,
             ash.session_id,
             ash.session_serial#,
+            ash.pga_allocated,
+            ash.temp_space_allocated,
+            ash.p1,
+            ash.p2,
+            ash.p3,
+            CASE 
+                WHEN ash.event like 'enq%' AND ash.session_state = 'WAITING'
+                THEN ash.event || ' [mode='||BITAND(ash.P1, POWER(2,14)-1)||']'
+                ELSE NVL(ash.event, ash.session_state)
+            END as event_extended,
             u.username,
             s.sql_text,
             COUNT(*) as session_count
@@ -325,6 +359,16 @@ class RACASHMonitor:
             ash.service_hash,
             ash.session_id,
             ash.session_serial#,
+            ash.pga_allocated,
+            ash.temp_space_allocated,
+            ash.p1,
+            ash.p2,
+            ash.p3,
+            CASE 
+                WHEN ash.event like 'enq%' AND ash.session_state = 'WAITING'
+                THEN ash.event || ' [mode='||BITAND(ash.P1, POWER(2,14)-1)||']'
+                ELSE NVL(ash.event, ash.session_state)
+            END,
             u.username,
             s.sql_text
         ORDER BY ash.sample_time
@@ -368,6 +412,10 @@ class RACASHMonitor:
                     int(row['instance_number'])
                 )
 
+            # Convert memory metrics to GB
+            pga_gb = float(row['pga_allocated']) / 1024 / 1024 / 1024 if pd.notna(row['pga_allocated']) else 0
+            temp_gb = float(row['temp_space_allocated']) / 1024 / 1024 / 1024 if pd.notna(row['temp_space_allocated']) else 0
+
             detail = {
                 'timestamp': row['sample_time'].isoformat() if isinstance(row['sample_time'], pd.Timestamp) else str(row['sample_time']),
                 'instance': int(row['instance_number']),
@@ -377,7 +425,7 @@ class RACASHMonitor:
                 'sql_id': str(row['sql_id']) if pd.notna(row['sql_id']) else None,
                 'sql_text': str(row['sql_text']) if pd.notna(row['sql_text']) else None,
                 'wait_class': str(row['wait_class']) if pd.notna(row['wait_class']) else None,
-                'event': str(row['event']) if pd.notna(row['event']) else None,
+                'event': str(row['event_extended']) if pd.notna(row['event_extended']) else str(row['event']) if pd.notna(row['event']) else None,
                 'program': str(row['program']) if pd.notna(row['program']) else None,
                 'module': str(row['module']) if pd.notna(row['module']) else None,
                 'machine': str(row['machine']) if pd.notna(row['machine']) else None,
@@ -385,6 +433,10 @@ class RACASHMonitor:
                 'blocking_session_serial#': int(row['blocking_session_serial#']) if pd.notna(row['blocking_session_serial#']) else None,
                 'blocking_instance': int(row['blocking_inst_id']) if pd.notna(row['blocking_inst_id']) else None,
                 'anomaly_score': float(scores[idx]),
+                'memory_usage': {
+                    'pga_gb': pga_gb,
+                    'temp_space_gb': temp_gb
+                },
                 'blocking_chain': blocking_chain
             }
 
@@ -450,6 +502,10 @@ class RACASHMonitor:
                         print(f"User: {detail['username']}")
                         print(f"Program: {detail['program']}")
                         
+                        # Memory usage
+                        mem = detail['memory_usage']
+                        print(f"Memory Usage: PGA {mem['pga_gb']:.2f} GB, Temp Space {mem['temp_space_gb']:.2f} GB")
+                        
                         # SQL and wait information
                         if detail['sql_id']:
                             print(f"SQL ID: {detail['sql_id']}")
@@ -474,6 +530,8 @@ class RACASHMonitor:
                                     print(f"     SQL ID: {blocked['sql_id']}")
                                     if blocked['sql_text']:
                                         print(f"     SQL Text: {blocked['sql_text']}")
+                                mem = blocked['memory_usage']
+                                print(f"     Memory Usage: PGA {mem['pga_gb']:.2f} GB, Temp Space {mem['temp_space_gb']:.2f} GB")
                         print()
 
                 connection.close()

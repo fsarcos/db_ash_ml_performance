@@ -69,6 +69,27 @@ def validate_ash_data(df):
 
     return df
 
+def decode_enqueue_wait(p1, p1raw):
+    """Decodes enqueue wait information"""
+    if p1 is None or p1raw is None:
+        return None
+
+    # Extract lock mode from p1
+    lock_mode = p1raw & (pow(2, 14) - 1)
+
+    # Common enqueue modes
+    modes = {
+        0: 'NONE',
+        1: 'NULL',
+        2: 'RS',
+        3: 'RX',
+        4: 'S',
+        5: 'SRX',
+        6: 'X'
+    }
+
+    return modes.get(lock_mode, f'Mode {lock_mode}')
+
 def collect_historical_ash(start_date, end_date, output_file):
     """Collects historical ASH data and saves to file"""
     ash_query = """
@@ -89,6 +110,18 @@ def collect_historical_ash(start_date, end_date, output_file):
         ash.ACTION as action,
         ash.MACHINE as machine,
         ash.SERVICE_HASH as service_hash,
+        ash.SESSION_ID as session_id,
+        ash.SESSION_SERIAL# as session_serial#,
+        ash.PGA_ALLOCATED as pga_allocated,
+        ash.TEMP_SPACE_ALLOCATED as temp_space_allocated,
+        ash.P1 as p1,
+        ash.P2 as p2,
+        ash.P3 as p3,
+        CASE 
+            WHEN ash.EVENT like 'enq%' AND ash.SESSION_STATE = 'WAITING'
+            THEN ash.EVENT || ' [mode='||BITAND(ash.P1, POWER(2,14)-1)||']'
+            ELSE NVL(ash.EVENT, ash.SESSION_STATE)
+        END as event_extended,
         COUNT(*) as session_count
     FROM dba_hist_active_sess_history ash
     WHERE ash.SAMPLE_TIME BETWEEN :start_date AND :end_date
@@ -108,36 +141,85 @@ def collect_historical_ash(start_date, end_date, output_file):
         ash.MODULE,
         ash.ACTION,
         ash.MACHINE,
-        ash.SERVICE_HASH
+        ash.SERVICE_HASH,
+        ash.SESSION_ID,
+        ash.SESSION_SERIAL#,
+        ash.PGA_ALLOCATED,
+        ash.TEMP_SPACE_ALLOCATED,
+        ash.P1,
+        ash.P2,
+        ash.P3,
+        CASE 
+            WHEN ash.EVENT like 'enq%' AND ash.SESSION_STATE = 'WAITING'
+            THEN ash.EVENT || ' [mode='||BITAND(ash.P1, POWER(2,14)-1)||']'
+            ELSE NVL(ash.EVENT, ash.SESSION_STATE)
+        END
     ORDER BY ash.SAMPLE_TIME
     """
 
     try:
         print(f"Collecting ASH data from {start_date} to {end_date}")
         with connect_as_sysdba() as connection:
-            # Read data in batches
+            # Read data in batches using cursor
             dfs = []
-            for offset in range(0, sys.maxsize, ASH_CONFIG['batch_size']):
-                batch_query = f"{ash_query} OFFSET {offset} ROWS FETCH NEXT {ASH_CONFIG['batch_size']} ROWS ONLY"
-                batch_df = pd.read_sql(batch_query, connection,
-                                     params={'start_date': start_date, 'end_date': end_date})
-                
-                if batch_df.empty:
+            batch_size = ASH_CONFIG['batch_size']
+            cursor = connection.cursor()
+            
+            cursor.execute(ash_query, {'start_date': start_date, 'end_date': end_date})
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
                     break
                     
+                # Convert to DataFrame
+                columns = [desc[0].lower() for desc in cursor.description]
+                batch_df = pd.DataFrame(rows, columns=columns)
                 dfs.append(batch_df)
-                print(f"Collected {len(dfs) * ASH_CONFIG['batch_size']} records...")
+                print(f"Collected {len(dfs) * batch_size} records...")
+
+            cursor.close()
 
             if not dfs:
                 print("Warning: No ASH data found for the specified time range")
                 return
 
             # Combine all batches
+            print("Combining batches...")
             df = pd.concat(dfs, ignore_index=True)
             print(f"Total records collected: {len(df)}")
 
+            print("Post processing data...")
+            # Post-process wait events - Vectorized operations instead of apply
+            if not df.empty:
+                # Create event_extended column using numpy where for better performance
+                import numpy as np
+                
+                # Initialize with session_state where event is null
+                df['event_extended'] = np.where(
+                    df['event'].isna(),
+                    df['session_state'],
+                    df['event']
+                )
+                
+                # Update enqueue waits
+                enq_mask = (df['event'].str.startswith('enq:', na=False)) & (df['session_state'] == 'WAITING')
+                if enq_mask.any():
+                    modes = np.where(
+                        df['p1'].notna(),
+                        df['p1'] & (pow(2, 14) - 1),
+                        'unknown'
+                    )
+                    df.loc[enq_mask, 'event_extended'] = df.loc[enq_mask, 'event'] + ' [mode=' + modes[enq_mask].astype(str) + ']'
+
             # Validate and process the data
             df = validate_ash_data(df)
+
+            # Calculate AAS (Average Active Sessions)
+            total_seconds = (df['sample_time'].max() - df['sample_time'].min()).total_seconds()
+            if total_seconds > 0:
+                aas = df['session_count'].sum() * 10 / total_seconds  # 10-second sampling
+            else:
+                aas = 0
 
             # Ensure output directory exists
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -154,17 +236,23 @@ def collect_historical_ash(start_date, end_date, output_file):
             print("\nData Summary:")
             try:
                 print(f"Time range: {df['sample_time'].min()} to {df['sample_time'].max()}")
+                print(f"Average Active Sessions (AAS): {aas:.2f}")
                 print(f"Unique instances: {df['instance_number'].nunique()}")
                 print(f"Unique wait classes: {df['wait_class'].nunique()}")
                 print(f"Total session count: {df['session_count'].sum()}")
+                print(f"Average PGA allocated: {df['pga_allocated'].mean() / 1024 / 1024 / 1024:.2f} GB")
+                print(f"Average temp space allocated: {df['temp_space_allocated'].mean() / 1024 / 1024 / 1024:.2f} GB")
 
-                # Wait class statistics with severity levels
+                # Wait class statistics with severity levels and percentages
                 print("\nWait Class Statistics:")
-                wait_class_stats = df.groupby('wait_class')['session_count'].sum().sort_values(ascending=False)
-                for wait_class, count in wait_class_stats.items():
+                wait_class_stats = df.groupby('wait_class')['session_count'].agg(['sum', 'count'])
+                total_sessions = wait_class_stats['sum'].sum()
+                
+                for wait_class, stats in wait_class_stats.iterrows():
                     if pd.notna(wait_class):
                         severity = ASH_CONFIG['wait_classes'].get(wait_class, {}).get('severity', 'UNKNOWN')
-                        print(f"  {wait_class} ({severity}): {count}")
+                        percentage = (stats['sum'] / total_sessions * 100) if total_sessions > 0 else 0
+                        print(f"  {wait_class} ({severity}): {stats['sum']} sessions ({percentage:.1f}%)")
 
             except Exception as e:
                 print(f"Warning: Error generating summary statistics: {str(e)}")

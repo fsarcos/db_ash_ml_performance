@@ -36,16 +36,23 @@ class SQLPatternAnalyzer:
             'session_count': 'sum',
             'sample_time': ['min', 'max', 'count'],
             'wait_class': lambda x: x.value_counts().to_dict(),
-            'event': lambda x: x.value_counts().to_dict(),
+            'event_extended': lambda x: x.value_counts().to_dict(),  # Use extended event info
             'module': lambda x: x.value_counts().to_dict(),
-            'program': lambda x: x.value_counts().to_dict()
+            'program': lambda x: x.value_counts().to_dict(),
+            'pga_allocated': ['mean', 'max'],  # Track memory usage
+            'temp_space_allocated': ['mean', 'max']  # Track temp space usage
         }).reset_index()
 
         # Rename columns for clarity
         sql_metrics.columns = [
             'sql_id', 'total_sessions', 'first_seen', 'last_seen',
-            'samples', 'wait_classes', 'events', 'modules', 'programs'
+            'samples', 'wait_classes', 'events', 'modules', 'programs',
+            'avg_pga', 'max_pga', 'avg_temp', 'max_temp'
         ]
+
+        # Convert memory metrics to GB
+        for col in ['avg_pga', 'max_pga', 'avg_temp', 'max_temp']:
+            sql_metrics[f'{col}_gb'] = sql_metrics[col] / 1024 / 1024 / 1024
 
         # Calculate execution time and frequency
         sql_metrics['execution_period'] = (
@@ -61,7 +68,16 @@ class SQLPatternAnalyzer:
     def analyze_sql_wait_patterns(self):
         """Analyze wait patterns for each SQL"""
         # Group by SQL_ID and wait_class
-        sql_waits = self.df.groupby(['sql_id', 'wait_class'])['session_count'].sum().reset_index()
+        sql_waits = self.df.groupby(['sql_id', 'wait_class']).agg({
+            'session_count': 'sum',
+            'pga_allocated': ['mean', 'max'],
+            'temp_space_allocated': ['mean', 'max']
+        }).reset_index()
+        
+        # Convert memory metrics to GB
+        for col in ['pga_allocated', 'temp_space_allocated']:
+            sql_waits[f'{col}_gb'] = sql_waits[col]['mean'] / 1024 / 1024 / 1024
+            sql_waits[f'{col}_max_gb'] = sql_waits[col]['max'] / 1024 / 1024 / 1024
         
         # Pivot to get wait classes as columns
         wait_patterns = sql_waits.pivot(
@@ -74,36 +90,22 @@ class SQLPatternAnalyzer:
         row_sums = wait_patterns.sum(axis=1)
         wait_patterns_pct = wait_patterns.div(row_sums, axis=0) * 100
         
-        return wait_patterns, wait_patterns_pct
-
-    def identify_sql_clusters(self, wait_patterns_pct, n_clusters=5):
-        """Identify SQL clusters based on wait patterns"""
-        from sklearn.cluster import KMeans
-        
-        # Handle empty dataframe
-        if wait_patterns_pct.empty:
-            return pd.DataFrame(), pd.DataFrame()
-        
-        # Perform clustering
-        kmeans = KMeans(n_clusters=min(n_clusters, len(wait_patterns_pct)), random_state=42)
-        clusters = kmeans.fit_predict(wait_patterns_pct.fillna(0))
-        
-        # Create cluster profiles
-        cluster_profiles = pd.DataFrame(
-            kmeans.cluster_centers_,
-            columns=wait_patterns_pct.columns
-        )
-        
-        # Add cluster assignments to wait patterns
-        wait_patterns_pct['cluster'] = clusters
-        
-        return wait_patterns_pct, cluster_profiles
+        return wait_patterns, wait_patterns_pct, sql_waits
 
     def analyze_temporal_patterns(self):
         """Analyze SQL execution patterns over time"""
         # Create hourly aggregations
         self.df['hour'] = self.df['sample_time'].dt.hour
-        temporal_patterns = self.df.groupby(['sql_id', 'hour'])['session_count'].sum().reset_index()
+        temporal_patterns = self.df.groupby(['sql_id', 'hour']).agg({
+            'session_count': 'sum',
+            'pga_allocated': ['mean', 'max'],
+            'temp_space_allocated': ['mean', 'max']
+        }).reset_index()
+        
+        # Convert memory metrics to GB
+        for col in ['pga_allocated', 'temp_space_allocated']:
+            temporal_patterns[f'{col}_gb'] = temporal_patterns[col]['mean'] / 1024 / 1024 / 1024
+            temporal_patterns[f'{col}_max_gb'] = temporal_patterns[col]['max'] / 1024 / 1024 / 1024
         
         # Pivot to get hours as columns
         temporal_matrix = temporal_patterns.pivot(
@@ -112,13 +114,14 @@ class SQLPatternAnalyzer:
             values='session_count'
         ).fillna(0)
         
-        return temporal_matrix
+        return temporal_matrix, temporal_patterns
 
     def generate_report(self):
         """Generate comprehensive SQL analysis report"""
         # Get SQL patterns
         sql_metrics = self.analyze_sql_patterns()
-        wait_patterns, wait_patterns_pct = self.analyze_sql_wait_patterns()
+        wait_patterns, wait_patterns_pct, sql_waits = self.analyze_sql_wait_patterns()
+        temporal_matrix, temporal_patterns = self.analyze_temporal_patterns()
         
         # Get top SQL IDs first
         top_sql = sql_metrics.nlargest(10, 'average_active_sessions')
@@ -126,16 +129,8 @@ class SQLPatternAnalyzer:
         # Ensure we only use SQL IDs that exist in both datasets
         common_sql_ids = set(top_sql['sql_id']).intersection(set(wait_patterns_pct.index))
         top_sql = top_sql[top_sql['sql_id'].isin(common_sql_ids)]
-        
-        # Only proceed with clustering if we have data
-        if not wait_patterns_pct.empty:
-            wait_patterns_pct, cluster_profiles = self.identify_sql_clusters(wait_patterns_pct)
-        else:
-            cluster_profiles = pd.DataFrame()
-        
-        temporal_matrix = self.analyze_temporal_patterns()
 
-        # Create visualizations only if we have data
+        # Create visualizations
         if not top_sql.empty:
             # 1. Top SQL by Active Sessions
             plt.figure(figsize=(15, 7))
@@ -145,7 +140,22 @@ class SQLPatternAnalyzer:
             plt.tight_layout()
             self.save_plot('top_sql_active_sessions')
 
-            # 2. Wait Class Distribution Heatmap
+            # 2. Memory Usage by Top SQL
+            plt.figure(figsize=(15, 7))
+            memory_data = pd.melt(
+                top_sql,
+                id_vars=['sql_id'],
+                value_vars=['avg_pga_gb', 'avg_temp_gb'],
+                var_name='Memory Type',
+                value_name='GB'
+            )
+            sns.barplot(data=memory_data, x='sql_id', y='GB', hue='Memory Type')
+            plt.title('Memory Usage by Top SQL')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            self.save_plot('top_sql_memory_usage')
+
+            # 3. Wait Class Distribution Heatmap
             if not wait_patterns_pct.empty:
                 plt.figure(figsize=(15, 8))
                 top_sql_waits = wait_patterns_pct.loc[top_sql['sql_id']]
@@ -154,7 +164,7 @@ class SQLPatternAnalyzer:
                 plt.tight_layout()
                 self.save_plot('sql_wait_distribution')
 
-            # 3. SQL Execution Timeline
+            # 4. SQL Execution Timeline
             if not temporal_matrix.empty:
                 plt.figure(figsize=(15, 7))
                 temporal_data = temporal_matrix.loc[temporal_matrix.index.isin(top_sql['sql_id'])]
@@ -178,7 +188,14 @@ class SQLPatternAnalyzer:
                         'average_active_sessions': float(row['average_active_sessions']),
                         'execution_period_hours': float(row['execution_period']),
                         'total_samples': int(row['samples']),
+                        'memory_usage': {
+                            'avg_pga_gb': float(row['avg_pga_gb']),
+                            'max_pga_gb': float(row['max_pga_gb']),
+                            'avg_temp_gb': float(row['avg_temp_gb']),
+                            'max_temp_gb': float(row['max_temp_gb'])
+                        },
                         'primary_wait_class': max(row['wait_classes'].items(), key=lambda x: x[1])[0] if row['wait_classes'] else 'None',
+                        'primary_event': max(row['events'].items(), key=lambda x: x[1])[0] if row['events'] else 'None',
                         'primary_module': max(row['modules'].items(), key=lambda x: x[1])[0] if row['modules'] else 'None'
                     }
                     for _, row in top_sql.iterrows()
@@ -187,15 +204,19 @@ class SQLPatternAnalyzer:
         }
 
         # Add wait patterns only if we have cluster data
-        if not cluster_profiles.empty:
+        if not wait_patterns_pct.empty:
             report['wait_patterns'] = {
-                'cluster_profiles': [
+                'sql_wait_patterns': [
                     {
-                        'cluster_id': i,
-                        'dominant_wait': profile.idxmax(),
-                        'wait_distribution': profile.to_dict()
+                        'sql_id': sql_id,
+                        'wait_distribution': pattern.to_dict(),
+                        'memory_usage': {
+                            'pga_gb': float(sql_waits[sql_waits['sql_id'] == sql_id]['pga_allocated_gb'].mean()),
+                            'temp_gb': float(sql_waits[sql_waits['sql_id'] == sql_id]['temp_space_allocated_gb'].mean())
+                        }
                     }
-                    for i, profile in cluster_profiles.iterrows()
+                    for sql_id, pattern in wait_patterns_pct.iterrows()
+                    if sql_id in top_sql['sql_id'].values
                 ]
             }
 
@@ -205,7 +226,11 @@ class SQLPatternAnalyzer:
                 'peak_hours': [
                     {
                         'hour': hour,
-                        'total_sessions': int(temporal_matrix[hour].sum())
+                        'total_sessions': int(temporal_matrix[hour].sum()),
+                        'memory_usage': {
+                            'avg_pga_gb': float(temporal_patterns[temporal_patterns['hour'] == hour]['pga_allocated_gb'].mean()),
+                            'avg_temp_gb': float(temporal_patterns[temporal_patterns['hour'] == hour]['temp_space_allocated_gb'].mean())
+                        }
                     }
                     for hour in temporal_matrix.sum().nlargest(3).index
                 ]
@@ -244,23 +269,21 @@ def main():
                 print(f"\nSQL_ID: {sql['sql_id']}")
                 print(f"- Average Active Sessions: {sql['average_active_sessions']:.2f}")
                 print(f"- Primary Wait Class: {sql['primary_wait_class']}")
+                print(f"- Primary Event: {sql['primary_event']}")
                 print(f"- Primary Module: {sql['primary_module']}")
                 print(f"- Execution Period: {sql['execution_period_hours']:.1f} hours")
-        
-        if 'wait_patterns' in report:
-            print("\nSQL Clustering Analysis:")
-            for profile in report['wait_patterns']['cluster_profiles']:
-                print(f"\nCluster {profile['cluster_id']}:")
-                print(f"- Dominant Wait Class: {profile['dominant_wait']}")
-                waits = sorted(profile['wait_distribution'].items(), key=lambda x: x[1], reverse=True)[:3]
-                print("- Top Wait Classes:")
-                for wait, pct in waits:
-                    print(f"  * {wait}: {pct:.1f}%")
+                print("- Memory Usage:")
+                mem = sql['memory_usage']
+                print(f"  * PGA: Avg {mem['avg_pga_gb']:.2f} GB, Peak {mem['max_pga_gb']:.2f} GB")
+                print(f"  * Temp: Avg {mem['avg_temp_gb']:.2f} GB, Peak {mem['max_temp_gb']:.2f} GB")
         
         if 'temporal_patterns' in report:
             print("\nPeak Execution Hours:")
             for peak in report['temporal_patterns']['peak_hours']:
-                print(f"- Hour {peak['hour']:02d}:00 - {peak['total_sessions']} total sessions")
+                print(f"- Hour {peak['hour']:02d}:00")
+                print(f"  * Total Sessions: {peak['total_sessions']}")
+                mem = peak['memory_usage']
+                print(f"  * Memory Usage: PGA {mem['avg_pga_gb']:.2f} GB, Temp {mem['avg_temp_gb']:.2f} GB")
         
         print("\nDetailed Analysis Files:")
         print(f"- Full report: {os.path.join(analyzer.analysis_dir, 'sql_analysis.json')}")
