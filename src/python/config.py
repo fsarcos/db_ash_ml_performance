@@ -10,9 +10,9 @@ import os
 # Mandatory settings for Oracle connectivity
 ORACLE_ENV = {
     'ORACLE_HOME': '/u01/app/oracle/product/19.0.0/dbhome_1',  # Path to Oracle installation
-    'ORACLE_SID': 'orcl',                                      # Oracle System Identifier
+    'ORACLE_SID': 'orcl',                                      # Oracle SID
     'LD_LIBRARY_PATH': '$ORACLE_HOME/lib',                     # Oracle library path
-    'PDB_NAME': 'BDGLAUCO'                                     # Pluggable Database name
+    'PDB_NAME': 'BDGLAUCO'                                     # PDB name
 }
 
 # Directory Structure Settings
@@ -34,7 +34,7 @@ ASH_CONFIG = {
     'data_format': 'csv',         # Output format for collected data
     'batch_size': 10000,          # Number of rows to process at once
     'wait_classes': {
-        # Documentation: https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/wait-events.html
+        # Documentation: https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/oracle-wait-events.html        
         'Administrative': {
             'description': 'Wait events for administrative operations',
             'severity': 'MEDIUM'

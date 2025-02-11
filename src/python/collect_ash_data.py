@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta
+import gzip
 from config import ORACLE_ENV, ASH_CONFIG, FILE_PATHS, get_pdb_directories, ensure_directories_exist
 
 def setup_oracle_env():
@@ -224,13 +225,13 @@ def collect_historical_ash(start_date, end_date, output_file):
             # Ensure output directory exists
             os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-            # Save data in specified format
-            if ASH_CONFIG['data_format'].lower() == 'csv':
-                df.to_csv(output_file, index=False)
-            else:
-                raise ValueError(f"Unsupported data format: {ASH_CONFIG['data_format']}")
+            # Save data in compressed format
+            compressed_file = f"{output_file}.gz"
+            
+            print(f"Saving compressed data to {compressed_file}")
+            df.to_csv(compressed_file, compression='gzip', index=False)
 
-            print(f"Data saved to {output_file}")
+            print(f"Data saved to {compressed_file}")
 
             # Print summary statistics
             print("\nData Summary:")

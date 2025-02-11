@@ -61,11 +61,11 @@ def train_model(data_file, model_output_file, scaler_output_file, feature_column
     try:
         # First read the CSV headers to check column names
         print(f"Reading data from {data_file}")
-        headers = pd.read_csv(data_file, nrows=0).columns.tolist()
+        headers = pd.read_csv(f"{data_file}.gz", compression='gzip', nrows=0).columns.tolist()
         print("Available columns:", headers)
         
         # Load historical data from CSV
-        df = pd.read_csv(data_file)
+        df = pd.read_csv(f"{data_file}.gz", compression='gzip')
         
         if df.empty:
             raise ValueError("No data found in the CSV file")
