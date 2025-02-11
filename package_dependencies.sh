@@ -34,7 +34,7 @@ pip download --only-binary :all: -r $REQUIREMENTS_FILE -d $PACKAGE_DIR/packages
 
 # Copy source files
 echo "Copying source files..."
-cp -r src/python/* $PACKAGE_DIR/
+find src/python/ -maxdepth 1 -type f -exec cp {} /$PACKAGE_DIR/ \;
 cp $REQUIREMENTS_FILE $PACKAGE_DIR/
 
 # Create deployment instructions for offline installation
