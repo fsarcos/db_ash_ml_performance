@@ -194,11 +194,11 @@ class RACASHMonitor:
                 s.event,
                 s.sql_id,
                 q.sql_text,
-                s.pga_allocated,
-                s.temp_space_allocated
+                s.pga_alloc,  /* Changed from pga_allocated */
+                s.temp_space  /* Changed from temp_space_allocated */
             FROM gv$session s
             LEFT JOIN dba_users u ON s.user# = u.user_id
-            LEFT JOIN v$sql q ON s.sql_id = q.sql_id
+            LEFT JOIN gv$sql q ON s.inst_id = q.inst_id AND s.sql_id = q.sql_id
             WHERE s.sid = :1 
             AND s.serial# = :2 
             AND s.inst_id = :3
@@ -215,7 +215,7 @@ class RACASHMonitor:
                 cursor.close()
                 
                 if row and row[0]:  # If there's a blocking session
-                    # Convert memory metrics to GB
+                    # Convert metrics to GB
                     pga_gb = float(row[9]) / 1024 / 1024 / 1024 if row[9] else 0
                     temp_gb = float(row[10]) / 1024 / 1024 / 1024 if row[10] else 0
                     
@@ -229,10 +229,8 @@ class RACASHMonitor:
                         'event': str(row[6]) if row[6] else None,
                         'sql_id': str(row[7]) if row[7] else None,
                         'sql_text': str(row[8])[:100] if row[8] else None,
-                        'memory_usage': {
-                            'pga_gb': pga_gb,
-                            'temp_space_gb': temp_gb
-                        }
+                        'pga_memory_gb': pga_gb,
+                        'temp_tablespace_gb': temp_gb
                     }
                     blocking_chain.append(blocking_info)
                     current_session = {
@@ -266,19 +264,29 @@ class RACASHMonitor:
         else:
             reasons.append(f'Normal anomaly score ({score:.3f})')
         
-        # Check memory usage
-        memory = session_details.get('memory_usage', {})
-        if memory:
-            pga_gb = memory.get('pga_gb', 0)
-            temp_gb = memory.get('temp_space_gb', 0)
-            if pga_gb > 10 or temp_gb > 10:  # More than 10GB of either type
-                severity = max(severity, 'CRITICAL')
-                reasons.append(f'High memory usage (PGA: {pga_gb:.2f} GB, Temp: {temp_gb:.2f} GB)')
-            elif pga_gb > 5 or temp_gb > 5:  # More than 5GB of either type
-                severity = max(severity, 'HIGH')
-                reasons.append(f'Elevated memory usage (PGA: {pga_gb:.2f} GB, Temp: {temp_gb:.2f} GB)')
-            else:
-                reasons.append(f'Normal memory usage (PGA: {pga_gb:.2f} GB, Temp: {temp_gb:.2f} GB)')
+        # Check PGA usage
+        pga_gb = session_details.get('pga_memory_gb', 0)
+        if pga_gb > 10:  # More than 10GB of PGA
+            severity = max(severity, 'CRITICAL')
+            reasons.append(f'High PGA usage ({pga_gb:.2f} GB)')
+        elif pga_gb > 5:  # More than 5GB of PGA
+            severity = max(severity, 'HIGH')
+            reasons.append(f'Elevated PGA usage ({pga_gb:.2f} GB)')
+        else:
+            reasons.append(f'Normal PGA usage ({pga_gb:.2f} GB)')
+        
+        # Check temp space usage separately
+        temp_gb = session_details.get('temp_tablespace_gb', 0)
+        if temp_gb > 10:  # More than 10GB of temp space
+            severity = max(severity, 'CRITICAL')
+            reasons.append(f'High temporary tablespace usage ({temp_gb:.2f} GB)')
+        elif temp_gb > 5:  # More than 5GB of temp space
+            severity = max(severity, 'HIGH')
+            reasons.append(f'Elevated temporary tablespace usage ({temp_gb:.2f} GB)')
+        elif temp_gb > 1:  # More than 1GB of temp space
+            reasons.append(f'Moderate temporary tablespace usage ({temp_gb:.2f} GB)')
+        else:
+            reasons.append(f'Normal temporary tablespace usage ({temp_gb:.2f} GB)')
         
         # Check wait class severity from config
         if session_details.get('wait_class'):
@@ -298,6 +306,67 @@ class RACASHMonitor:
                 reasons.append('Part of blocking chain')
         
         return severity, reasons
+
+    def get_session_details(self, df, predictions, scores, connection):
+        """Extract detailed information about anomalous sessions"""
+        anomalous_indices = np.where(predictions == -1)[0]
+        session_details = []
+        seen_sessions = set()
+
+        for idx in anomalous_indices:
+            row = df.iloc[idx]
+            session_key = (int(row['instance_number']),
+                         int(row['session_id']) if pd.notna(row['session_id']) else None)
+
+            if session_key in seen_sessions:
+                continue
+
+            seen_sessions.add(session_key)
+
+            # Get blocking chain
+            blocking_chain = []
+            if pd.notna(row['blocking_session']):
+                blocking_chain = self.get_blocking_chain(
+                    connection,
+                    int(row['session_id']),
+                    int(row['session_serial#']) if pd.notna(row['session_serial#']) else None,
+                    int(row['instance_number'])
+                )
+
+            # Convert metrics to GB
+            pga_gb = float(row['pga_allocated']) / 1024 / 1024 / 1024 if pd.notna(row['pga_allocated']) else 0
+            temp_gb = float(row['temp_space_allocated']) / 1024 / 1024 / 1024 if pd.notna(row['temp_space_allocated']) else 0
+
+            detail = {
+                'timestamp': row['sample_time'].isoformat() if isinstance(row['sample_time'], pd.Timestamp) else str(row['sample_time']),
+                'instance': int(row['instance_number']),
+                'session_id': int(row['session_id']) if pd.notna(row['session_id']) else None,
+                'session_serial#': int(row['session_serial#']) if pd.notna(row['session_serial#']) else None,
+                'username': str(row['username']) if pd.notna(row['username']) else 'UNKNOWN',
+                'sql_id': str(row['sql_id']) if pd.notna(row['sql_id']) else None,
+                'sql_text': str(row['sql_text']) if pd.notna(row['sql_text']) else None,
+                'wait_class': str(row['wait_class']) if pd.notna(row['wait_class']) else None,
+                'event': str(row['event_extended']) if pd.notna(row['event_extended']) else str(row['event']) if pd.notna(row['event']) else None,
+                'program': str(row['program']) if pd.notna(row['program']) else None,
+                'module': str(row['module']) if pd.notna(row['module']) else None,
+                'machine': str(row['machine']) if pd.notna(row['machine']) else None,
+                'blocking_session': int(row['blocking_session']) if pd.notna(row['blocking_session']) else None,
+                'blocking_session_serial#': int(row['blocking_session_serial#']) if pd.notna(row['blocking_session_serial#']) else None,
+                'blocking_instance': int(row['blocking_inst_id']) if pd.notna(row['blocking_inst_id']) else None,
+                'anomaly_score': float(scores[idx]),
+                'pga_memory_gb': pga_gb,
+                'temp_tablespace_gb': temp_gb,
+                'blocking_chain': blocking_chain
+            }
+
+            # Determine severity
+            severity, reasons = self.determine_severity(detail)
+            detail['severity'] = severity
+            detail['severity_reasons'] = reasons
+
+            session_details.append(detail)
+
+        return session_details, len(seen_sessions)
 
     def collect_current_ash(self):
         """Collects current ASH metrics from GV$ACTIVE_SESSION_HISTORY"""
@@ -337,7 +406,7 @@ class RACASHMonitor:
             COUNT(*) as session_count
         FROM gv$active_session_history ash
         LEFT JOIN dba_users u ON ash.user_id = u.user_id
-        LEFT JOIN v$sql s ON ash.sql_id = s.sql_id
+        LEFT JOIN gv$sql s ON ash.inst_id=s.inst_id AND ash.sql_id = s.sql_id
         WHERE ash.sample_time >= SYSTIMESTAMP - INTERVAL '{MONITORING_CONFIG['lookback_minutes']}' MINUTE
         GROUP BY
             ash.inst_id,
@@ -385,69 +454,6 @@ class RACASHMonitor:
         except Exception as e:
             connection.close()
             raise
-
-    def get_session_details(self, df, predictions, scores, connection):
-        """Extract detailed information about anomalous sessions"""
-        anomalous_indices = np.where(predictions == -1)[0]
-        session_details = []
-        seen_sessions = set()
-
-        for idx in anomalous_indices:
-            row = df.iloc[idx]
-            session_key = (int(row['instance_number']),
-                         int(row['session_id']) if pd.notna(row['session_id']) else None)
-
-            if session_key in seen_sessions:
-                continue
-
-            seen_sessions.add(session_key)
-
-            # Get blocking chain
-            blocking_chain = []
-            if pd.notna(row['blocking_session']):
-                blocking_chain = self.get_blocking_chain(
-                    connection,
-                    int(row['session_id']),
-                    int(row['session_serial#']) if pd.notna(row['session_serial#']) else None,
-                    int(row['instance_number'])
-                )
-
-            # Convert memory metrics to GB
-            pga_gb = float(row['pga_allocated']) / 1024 / 1024 / 1024 if pd.notna(row['pga_allocated']) else 0
-            temp_gb = float(row['temp_space_allocated']) / 1024 / 1024 / 1024 if pd.notna(row['temp_space_allocated']) else 0
-
-            detail = {
-                'timestamp': row['sample_time'].isoformat() if isinstance(row['sample_time'], pd.Timestamp) else str(row['sample_time']),
-                'instance': int(row['instance_number']),
-                'session_id': int(row['session_id']) if pd.notna(row['session_id']) else None,
-                'session_serial#': int(row['session_serial#']) if pd.notna(row['session_serial#']) else None,
-                'username': str(row['username']) if pd.notna(row['username']) else 'UNKNOWN',
-                'sql_id': str(row['sql_id']) if pd.notna(row['sql_id']) else None,
-                'sql_text': str(row['sql_text']) if pd.notna(row['sql_text']) else None,
-                'wait_class': str(row['wait_class']) if pd.notna(row['wait_class']) else None,
-                'event': str(row['event_extended']) if pd.notna(row['event_extended']) else str(row['event']) if pd.notna(row['event']) else None,
-                'program': str(row['program']) if pd.notna(row['program']) else None,
-                'module': str(row['module']) if pd.notna(row['module']) else None,
-                'machine': str(row['machine']) if pd.notna(row['machine']) else None,
-                'blocking_session': int(row['blocking_session']) if pd.notna(row['blocking_session']) else None,
-                'blocking_session_serial#': int(row['blocking_session_serial#']) if pd.notna(row['blocking_session_serial#']) else None,
-                'blocking_instance': int(row['blocking_inst_id']) if pd.notna(row['blocking_inst_id']) else None,
-                'anomaly_score': float(scores[idx]),
-                'memory_usage': {
-                    'pga_gb': pga_gb,
-                    'temp_space_gb': temp_gb
-                },
-                'blocking_chain': blocking_chain
-            }
-
-            # Determine severity
-            severity, reasons = self.determine_severity(detail)
-            detail['severity'] = severity
-            detail['severity_reasons'] = reasons
-
-            session_details.append(detail)
-
-        return session_details, len(seen_sessions)
 
     def monitor(self, interval_seconds=None):
         interval = interval_seconds or MONITORING_CONFIG['interval_seconds']
@@ -502,11 +508,10 @@ class RACASHMonitor:
                         print(f"User: {detail['username']}")
                         print(f"Program: {detail['program']}")
                         
-                        # Memory usage
-                        mem = detail['memory_usage']
-                        print(f"Memory Usage: PGA {mem['pga_gb']:.2f} GB, Temp Space {mem['temp_space_gb']:.2f} GB")
+                        # Resource usage - now separated
+                        print(f"PGA Memory Usage: {detail['pga_memory_gb']:.2f} GB")
+                        print(f"Temporary Tablespace Usage: {detail['temp_tablespace_gb']:.2f} GB")
                         
-                        # SQL and wait information
                         if detail['sql_id']:
                             print(f"SQL ID: {detail['sql_id']}")
                             if detail['sql_text']:
@@ -530,8 +535,8 @@ class RACASHMonitor:
                                     print(f"     SQL ID: {blocked['sql_id']}")
                                     if blocked['sql_text']:
                                         print(f"     SQL Text: {blocked['sql_text']}")
-                                mem = blocked['memory_usage']
-                                print(f"     Memory Usage: PGA {mem['pga_gb']:.2f} GB, Temp Space {mem['temp_space_gb']:.2f} GB")
+                                print(f"     PGA Memory Usage: {blocked['pga_memory_gb']:.2f} GB")
+                                print(f"     Temporary Tablespace Usage: {blocked['temp_tablespace_gb']:.2f} GB")
                         print()
 
                 connection.close()

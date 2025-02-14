@@ -23,7 +23,7 @@ def preprocess_ash_data(df):
         'user_id': 'nunique',
         'blocking_session': lambda x: (x.notna()).sum()
     }).reset_index()
-    
+
     # Pivot wait classes and session states
     wait_pivot = agg_df.pivot_table(
         index=['sample_time', 'instance_number'],
@@ -31,7 +31,7 @@ def preprocess_ash_data(df):
         values='session_count',
         fill_value=0
     )
-    
+
     state_pivot = agg_df.pivot_table(
         index=['sample_time', 'instance_number'],
         columns='session_state',
@@ -49,11 +49,11 @@ def preprocess_ash_data(df):
             'blocking_session': 'first'
         })
     ], axis=1)
-    
+
     # Add time-based features
     features['hour'] = features.index.get_level_values('sample_time').hour
     features['day_of_week'] = features.index.get_level_values('sample_time').dayofweek
-    
+
     return features
 
 def train_model(data_file, model_output_file, scaler_output_file, feature_columns_file):

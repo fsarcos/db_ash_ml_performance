@@ -10,7 +10,7 @@ from config import get_pdb_directories, ensure_directories_exist
 class ContentionAnalyzer:
     def __init__(self, data_file):
         """Initialize the analyzer with ASH data"""
-        self.df = pd.read_csv(data_file)
+        self.df = pd.read_csv(f"{data_file}.gz", compression='gzip'
         self.df['sample_time'] = pd.to_datetime(self.df['sample_time'])
         
         # Setup directories
